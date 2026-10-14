@@ -1,0 +1,4 @@
+[submodule "third_party/video_to_data"]
+	path = third_party/video_to_data
+	url = https://github.com/tianchen2001/video_to_data
+	branch = tim/track2
