@@ -97,21 +97,56 @@ def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
     return T
 
 
-def support_boxes(usda: Path | None):
-    """[(center_xyz, size_xyz)] for Cube prims in a *_support.usda (best-effort regex parse)."""
+def support_prims(usda: Path | None) -> list[dict]:
+    """Cube / Cylinder prims of a *_support.usda as FlashCHORD scene/support.py builds them:
+    translate + (size | radius, height) times xformOp:scale, axis Z. Returns dicts with a trimesh and an SDF."""
     if usda is None or not usda.exists() or usda.stat().st_size == 0:
         return []
-    txt = usda.read_text(errors="ignore")
-    boxes = []
-    for block in re.finditer(r'def Cube "[^"]*"\s*\{(.*?)\n\s*\}', txt, re.S):
-        body = block.group(1)
+    txt = usda.read_text(errors="ignore"); out = []
+    num = r"([-\d.eE+]+)"
+    for m in re.finditer(r'def (Cube|Cylinder) "([^"]*)"\s*(?:\((?:[^()]|\([^()]*\))*\))?\s*\{(.*?)\n\s*\}', txt, re.S):
+        kind, name, body = m.groups()
         tr = re.search(r"xformOp:translate\s*=\s*\(([^)]*)\)", body)
-        c = [float(v) for v in tr.group(1).split(",")] if tr else [0, 0, 0]
-        sz = re.search(r"double size\s*=\s*([\d.eE+-]+)", body); s = float(sz.group(1)) if sz else 2.0
+        c = np.array([float(v) for v in tr.group(1).split(",")]) if tr else np.zeros(3)
         sc = re.search(r"xformOp:scale\s*=\s*\(([^)]*)\)", body)
-        scale = [float(v) for v in sc.group(1).split(",")] if sc else [1, 1, 1]
-        boxes.append((np.array(c), np.array(scale) * s))
-    return boxes
+        scale = np.abs(np.array([float(v) for v in sc.group(1).split(",")])) if sc else np.ones(3)
+        if kind == "Cube":
+            sz = re.search(r"(?:double|float) size\s*=\s*" + num, body)
+            ext = (float(sz.group(1)) if sz else 2.0) * scale
+            mesh = trimesh.creation.box(extents=ext); mesh.apply_translation(c)
+            out.append({"kind": "box", "name": name, "c": c, "half": ext / 2, "mesh": mesh, "top": c[2] + ext[2] / 2})
+        else:
+            rd = re.search(r"(?:double|float) radius\s*=\s*" + num, body); ht = re.search(r"(?:double|float) height\s*=\s*" + num, body)
+            r_ = (float(rd.group(1)) if rd else 1.0) * max(scale[0], scale[1]); h_ = (float(ht.group(1)) if ht else 2.0) * scale[2]
+            mesh = trimesh.creation.cylinder(radius=r_, height=h_, sections=48); mesh.apply_translation(c)
+            out.append({"kind": "cyl", "name": name, "c": c, "r": r_, "hh": h_ / 2, "mesh": mesh, "top": c[2] + h_ / 2})
+    return out
+
+
+def support_sdf(p: np.ndarray, prims: list[dict]) -> np.ndarray:
+    """Signed distance (positive outside) of points p (N,3) to the union of the support prims."""
+    best = np.full(len(p), np.inf)
+    for pr in prims:
+        d = p - pr["c"]
+        if pr["kind"] == "box":
+            q = np.abs(d) - pr["half"]
+            v = np.linalg.norm(np.maximum(q, 0), axis=1) + np.minimum(q.max(axis=1), 0)
+        else:
+            a = np.linalg.norm(d[:, :2], axis=1) - pr["r"]; b = np.abs(d[:, 2]) - pr["hh"]
+            v = np.hypot(np.maximum(a, 0), np.maximum(b, 0)) + np.minimum(np.maximum(a, b), 0)
+        best = np.minimum(best, v)
+    return best
+
+
+def support_under(p: np.ndarray, prims: list[dict], depth: float) -> np.ndarray:
+    """How far below a support top each point is while inside its footprint (0 if not), down to `depth`."""
+    out = np.zeros(len(p))
+    for pr in prims:
+        d = p - pr["c"]
+        inside = np.all(np.abs(d[:, :2]) <= pr["half"][:2], axis=1) if pr["kind"] == "box" else np.linalg.norm(d[:, :2], axis=1) <= pr["r"]
+        below = pr["top"] - p[:, 2]
+        out = np.maximum(out, np.where(inside & (below > 0) & (below < depth), below, 0.0))
+    return out
 
 
 # ----------------------------------------------------------------------------- parquet
@@ -232,6 +267,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--mesh", type=Path, default=None, help="object mesh override (default: object_mesh_paths[0] from the parquet)")
     ap.add_argument("--support", type=Path, default=None, help="optional *_support.usda, drawn and used for the support gap")
+    ap.add_argument("--under-depth", type=float, default=0.30,
+                    help="m: a link this far below a support top inside its footprint counts as through the table (thin tops)")
     ap.add_argument("--sid", default=None, help="name for output files (default: from the parquet path)")
     ap.add_argument("--stride", type=int, default=1, help="render every n-th frame (numbers are computed for all frames)")
     ap.add_argument("--views", nargs="+", default=["overview", "top"], choices=["overview", "side", "top", "close"],
@@ -289,6 +326,12 @@ def main() -> None:
     is_hand = [("hand" in g["link"]) for g in robot.geoms]
     side_of = [("left" if g["link"].startswith("left") else "right" if g["link"].startswith("right") else None) for g in robot.geoms]
 
+    prims = support_prims(args.support)
+    top = max(pr["top"] for pr in prims) if prims else None
+    for pr in prims:
+        ext = 2 * pr["half"] if pr["kind"] == "box" else np.array([2 * pr["r"], 2 * pr["r"], 2 * pr["hh"]])
+        print(f"  support {pr['name']} ({pr['kind']}): centre {np.round(pr['c'], 3).tolist()}, extent {np.round(ext, 3).tolist()} m, top {pr['top']:.3f}")
+
     # ---- per-frame numbers
     rows, geom_poses = [], []
     t0 = time.time()
@@ -319,6 +362,15 @@ def main() -> None:
         wb = min(body, key=lambda i: link_gap[i])
         r["body_gap"] = link_gap[wb]; r["body_worst_link"] = robot.geoms[wb]["link"]
         r["obj_min_z"] = float((obj_mesh.vertices @ Rm.T + tr)[:, 2].min())
+        if prims:  # robot vs support: signed gap, and how far a link is under a (thin) top inside its footprint
+            sg, su, sl, worst = np.inf, 0.0, "", 0.0
+            for i, g in enumerate(robot.geoms):
+                pw = g["pts"] @ poses[i][:3, :3].T + poses[i][:3, 3]
+                v = float(support_sdf(pw, prims).min()); u = float(support_under(pw, prims, args.under_depth).max())
+                if max(-v, u) > worst:
+                    worst, sl = max(-v, u), g["link"]
+                sg = min(sg, v); su = max(su, u)
+            r["support_gap"] = sg; r["under_support"] = su; r["support_worst_link"] = sl
         if rollout:
             r["obj_pos_err"] = float(pos_err[t]); r["obj_rot_err"] = float(rot_err[t])
         r["foot_min_z"] = min(robot.frame_z(n) for n in FOOT_LINKS)
@@ -326,8 +378,6 @@ def main() -> None:
         if t % 100 == 0:
             print("  frame %d/%d (%.2fs/frame)  " % (t, T, (time.time() - t0) / (t + 1)) + "  ".join(f"{s[0].upper()} {r[f'{s}_hand_gap']*100:+.1f} cm" for s in sides) + f"  body {r['body_gap']*100:+.1f} cm")
 
-    boxes = support_boxes(args.support)
-    top = max(c[2] + s[2] / 2 for c, s in boxes) if boxes else None
 
     with (args.out / f"{sid}.csv").open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
@@ -365,6 +415,12 @@ def main() -> None:
     if top is not None:
         summ["support_top_m"] = top
         summ["object_through_support_frames"] = int((omz - top < -PEN_REPORT).sum())
+        sgap = np.array([r["support_gap"] for r in rows]); sund = np.array([r["under_support"] for r in rows])
+        bad = (sgap < -PEN_REPORT) | (sund > PEN_REPORT)
+        summ["robot_in_support_frames"] = int(bad.sum())
+        summ["robot_in_support_first_frame"] = int(np.argmax(bad)) if bad.any() else -1
+        summ["robot_support_pen_max_mm"] = float(max(0.0, -sgap.min(), sund.max()) * 1000)
+        summ["robot_support_links"] = sorted({r["support_worst_link"] for r in rows if r["support_gap"] < -PEN_REPORT or r["under_support"] > PEN_REPORT})
     (args.out / f"{sid}.json").write_text(json.dumps(summ, indent=2))
     print(json.dumps(summ, indent=2))
 
@@ -379,6 +435,9 @@ def main() -> None:
         axes[0].plot(tt, gp, color=c, lw=1.2, label=f"{s} hand")
         axes[0].fill_between(tt, -8, 25, where=lab == 1, color=c, alpha=0.08, lw=0)
     axes[0].plot(tt, bg * 100, color="#52514e", lw=0.9, ls="--", label="rest of body")
+    if prims:
+        pen_sup = np.maximum(np.clip(-np.array([r["support_gap"] for r in rows]), 0, None), np.array([r["under_support"] for r in rows]))
+        axes[0].plot(tt, -pen_sup * 100, color="#c0392b", lw=1.2, label="robot inside / under table (neg.)")
     axes[0].axhline(0, color="#000", lw=0.8); axes[0].axhline(2, color="#8a8984", lw=0.6, ls=":")
     axes[0].set_ylim(-8, 25); axes[0].set_ylabel("gap to object, cm"); axes[0].legend(loc="upper right", fontsize=8, ncol=3)
     axes[0].set_title(f"{sid}: G1 link surface vs object surface (negative = penetration; shaded = contact label on)", fontsize=10, loc="left")
@@ -413,9 +472,9 @@ def main() -> None:
     scene = pyrender.Scene(bg_color=[0.96, 0.96, 0.95, 1.0], ambient_light=[0.4, 0.4, 0.4])
     ground = trimesh.creation.box(extents=(8, 8, 0.01)); ground.apply_translation((0, 0, -0.005))
     scene.add(pyrender.Mesh.from_trimesh(ground, material=mat((0.82, 0.82, 0.80))))
-    for c, s in boxes:
-        b = trimesh.creation.box(extents=s); b.apply_translation(c)
-        scene.add(pyrender.Mesh.from_trimesh(b, material=mat((0.70, 0.66, 0.58))))
+    for pr in prims:
+        scene.add(pyrender.Mesh.from_trimesh(pr["mesh"], material=pyrender.MetallicRoughnessMaterial(
+            baseColorFactor=[0.70, 0.55, 0.40, 0.75], alphaMode="BLEND", metallicFactor=0.0, roughnessFactor=0.9)))
     obj_vis = trimesh.Trimesh(obj_mesh.vertices, obj_mesh.faces, process=False)  # drop textures
     obj_mat = pyrender.MetallicRoughnessMaterial(baseColorFactor=[0.25, 0.60, 0.35, 0.55], alphaMode="BLEND",
                                                  metallicFactor=0.1, roughnessFactor=0.8, doubleSided=True)
@@ -532,6 +591,10 @@ def main() -> None:
             state = f"PENETRATION {-gv*100:.1f} cm" if gv < -PEN_REPORT else f"gap {gv*100:.1f} cm"
             lines.append(f"{s:>5} hand: {state}   ({r[f'{s}_hand_worst_link']})   label {'ON' if r[f'{s}_label'] == 1 else 'off'}")
         lines.append(f" body: gap {r['body_gap']*100:.1f} cm ({r['body_worst_link']})")
+        if prims:
+            ps = max(-r["support_gap"], r["under_support"])
+            lines.append((f"TABLE PENETRATION {ps*100:.1f} cm ({r['support_worst_link']})" if ps > PEN_REPORT
+                          else f"table: clear ({r['support_gap']*100:.1f} cm)"))
         if rollout:
             lines.append(f"object vs reference: {r['obj_pos_err']*100:.1f} cm, {np.degrees(r['obj_rot_err']):.0f} deg   (grey ghost = reference)")
         lines.append(f"object min z {r['obj_min_z']*100:.1f} cm   foot min z {r['foot_min_z']*100:.1f} cm"

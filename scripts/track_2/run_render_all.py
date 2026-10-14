@@ -102,7 +102,8 @@ def main() -> None:
         if not args.force and (args.out / f"{name}.json").exists():
             print(f"skip {name} (done)")
             continue
-        support = (args.motion_root / "whole_body" / "reconstructed_stage" / f"{sid}_support.usda") if args.motion_root else Path("/nonexistent")
+        stage = (args.motion_root / "whole_body" / "reconstructed_stage") if args.motion_root else Path("/nonexistent")
+        support = next((c for c in (stage / f"{sid}_g1_support.usda", stage / f"{sid}_support.usda") if c.exists()), stage / f"{sid}_support.usda")
         cmd = [sys.executable, str(CHECK), "--toolkit", str(args.toolkit), "--parquet", str(pq), "--out", str(args.out),
                "--sid", name, "--stride", str(args.stride), *args.extra]
         if support.exists() and support.stat().st_size > 0:
