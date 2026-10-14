@@ -10,7 +10,7 @@ evaluate_policy.py or by the kit's run_policy_evaluation.py), per episode and on
         350M-1w=/localscratch/wangti98/eval_merged_tier1 \
         [--metric mppe_cm] [--csv out.csv] [--low-sr 0.1]
 
-Prints one table per metric (AUC, SR, MP-SR, MPPE) with one column per run, the means, the
+Prints one table per metric (AUC, SP-SR, MP-SR, MPPE, and the internal CHORD-SR) with one column per run, the means, the
 baseline row from the leaderboard, and the episodes whose SR is <= --low-sr in the last run.
 """
 from __future__ import annotations
@@ -21,9 +21,10 @@ import glob
 import json
 from pathlib import Path
 
-KEYS = {"add_auc": "AUC", "chord_sr": "SR", "maniptrans_sr": "MP-SR", "mppe_cm": "MPPE"}
-BASELINE = {"add_auc": 0.51, "chord_sr": 0.70, "maniptrans_sr": 0.20, "mppe_cm": 17.7}  # Tier 1 CHORD baseline, leaderboard Oct 6
-HIGHER = {"add_auc": True, "chord_sr": True, "maniptrans_sr": True, "mppe_cm": False}
+# leaderboard metrics: AUC, SP-SR (= spider_sr_uncentered), MP-SR (= maniptrans_sr), MPPE; chord_sr is FlashCHORD-internal
+KEYS = {"add_auc": "AUC", "spider_sr_uncentered": "SP-SR", "maniptrans_sr": "MP-SR", "mppe_cm": "MPPE", "chord_sr": "CHORD-SR"}
+BASELINE = {"add_auc": 0.51, "spider_sr_uncentered": 0.70, "maniptrans_sr": 0.20, "mppe_cm": 17.7, "chord_sr": None}  # Tier 1 baseline, leaderboard Oct 6
+HIGHER = {"add_auc": True, "spider_sr_uncentered": True, "maniptrans_sr": True, "mppe_cm": False, "chord_sr": True}
 
 
 def load_dir(d: Path) -> dict[int, dict]:
@@ -72,7 +73,8 @@ def main() -> None:
             v = [r[e][k] for e in episodes if e in r and r[e][k] is not None]
             means.append(sum(v) / len(v) if v else None)
         print(f"{'':>3} {'mean':<20} " + " ".join(f"{fmt(m, k):>8}" for m in means))
-        print(f"{'':>3} {'baseline (CHORD)':<20} " + " ".join(f"{fmt(BASELINE[k], k):>8}" for _ in runs))
+        if BASELINE[k] is not None:
+            print(f"{'':>3} {'baseline (CHORD)':<20} " + " ".join(f"{fmt(BASELINE[k], k):>8}" for _ in runs))
         worlds = [next((r[e]['worlds'] for e in episodes if e in r), None) for _, r in runs]
         print(f"{'':>3} {'worlds':<20} " + " ".join(f"{str(w):>8}" for w in worlds))
     for ep in episodes:
@@ -82,8 +84,8 @@ def main() -> None:
                 row[f"{lab}_{KEYS[k]}"] = r.get(ep, {}).get(k)
         rows.append(row)
     last_label, last = runs[-1]
-    low = [ep for ep in episodes if ep in last and last[ep]["chord_sr"] is not None and last[ep]["chord_sr"] <= args.low_sr]
-    print(f"\nepisodes with SR <= {args.low_sr} in {last_label}: {low}  ({', '.join(names.get(e, str(e)) for e in low)})")
+    low = [ep for ep in episodes if ep in last and last[ep]["spider_sr_uncentered"] is not None and last[ep]["spider_sr_uncentered"] <= args.low_sr]
+    print(f"\nepisodes with SP-SR <= {args.low_sr} in {last_label}: {low}  ({', '.join(names.get(e, str(e)) for e in low)})")
     if args.csv:
         with args.csv.open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
