@@ -8,8 +8,10 @@
 #        /localscratch/wangti98/flash_chord_outputs/videos/tier1_v2 1 2 4 7
 #
 # Env overrides:
-#   VIEWS="overview side top"   any of: overview front back left right side top (one simulator run per view; the
-#            rollout is deterministic, so every view shows the same motion). Output <out>/ep_NN.mp4 = views side by side.
+#   VIEWS="overview side top"   any of: overview front back left right side top. ONE simulator run per episode,
+#            every view drawn from it (multiview_policy.py, same folder). Output <out>/ep_NN.mp4 = views side by side.
+#            The overlay metrics are computed from this rollout (<out>/raw/ep_NN_rollout.parquet), not from the evaluator
+#            run, because GPU contact solving is not bitwise reproducible and two runs can differ.
 #   VIEW_BACKEND=mp4 (default) | viser (interactive browser view, one episode at a time, first view only)
 #   WIDTH / HEIGHT per view (default 1280x720 for one view, 960x540 for several)
 #   MARKERS="markers.keypoints=false markers.contacts=false"  (default: point markers off; they crash the GL
@@ -21,11 +23,16 @@
 #            OFFICIAL=0 keeps training-style termination (the video restarts from frame 0 on failure)
 #   OVERLAY=1 (default) draw per-frame pos / rot / keypoint error and SP / MP status (overlay_metrics.py, same
 #            folder as this script, uses results/episode_NNNNNN.parquet); raw viewer videos stay in <out>/raw/
+#   FPS=50            video fps = control rate of the policy (50 for the recipe, 30 for sim.fps=30 runs), so the
+#                     video plays in real time
+#   RESULTS=<dir>     evaluator results of these checkpoints (default <selection dir>/results); needed for the
+#                     episode length, the camera and the metric overlay, so episodes without one are skipped
 #   EXTRA="..." any further Hydra overrides
 set -u
 export PYGLET_HEADLESS=${PYGLET_HEADLESS:-true}
 HERE=$(cd "$(dirname "$0")" && pwd)
 SEL=$1; OUT=$2; shift 2
+RESULTS=${RESULTS:-$SEL/results}   # evaluator trajectories episode_NNNNNN.parquet of these checkpoints
 EPS=${*:-$(python -c "import json; print(' '.join(sorted(json.load(open('$SEL/checkpoints.json')), key=int)))")}
 ROOT=$(python -c "import flash_chord, pathlib; print(pathlib.Path(flash_chord.__file__).resolve().parents[2])")
 VIEW=$ROOT/scripts/view_policy.py
@@ -37,6 +44,7 @@ NV=$(echo $VIEWS | wc -w)
 if [ "$NV" -gt 1 ]; then W=${WIDTH:-960}; H=${HEIGHT:-540}; else W=${WIDTH:-1280}; H=${HEIGHT:-720}; fi
 MARKERS=${MARKERS-markers.keypoints=false markers.contacts=false}
 EXTRA=${EXTRA:-}
+FPS=${FPS:-50}
 # Match flash_chord.evaluation.harness (official evaluator): no VOC, no tracking-failure termination (a failed
 # world keeps running to the reference end instead of resetting), reset seed 42, always start at frame 0.
 DIS=1.0e6
@@ -48,60 +56,69 @@ done
 [ "${OFFICIAL:-1}" = 1 ] || EVAL_MATCH="env.voc_scale=0.0"   # OFFICIAL=0: old behaviour (resets on failure)
 mkdir -p "$OUT/raw"
 
-cam_for() {  # $1 trajectory parquet, $2 view name -> viewer.camera_position=[..] viewer.camera_target=[..]
-  VIEWNAME=$2 python - "$1" <<'EOF' 2>/dev/null
-import os, sys
+views_json() {  # $1 trajectory parquet, $2 out prefix, $3.. view names -> JSON list for multiview_policy.py
+  PQ=$1 PREFIX=$2 python - "${@:3}" <<'EOF'
+import json, os, sys
 import numpy as np
 import pyarrow.parquet as pq
 dirs = {"overview": os.environ.get("CAM_DIR", "-1 1 0.55"), "front": "1 0 0.35", "back": "-1 0 0.35",
         "left": "0 1 0.35", "right": "0 -1 0.35", "side": "0 -1 0.35", "top": "0.03 0.0 1"}
-view = os.environ["VIEWNAME"]
-t = pq.read_table(sys.argv[1], columns=[f"reference_position_{a}" for a in "xyz"])
+t = pq.read_table(os.environ["PQ"], columns=[f"reference_position_{a}" for a in "xyz"])
 p = np.stack([t.column(f"reference_position_{a}").to_numpy() for a in "xyz"], 1)
 p = p[np.isfinite(p).all(1)]
 lo, hi = p.min(0), p.max(0)
 tgt = (lo + hi) / 2
 tgt[2] = max(0.6, tgt[2])                         # look at roughly torso height when the object is on the floor
 extent = float(np.linalg.norm(hi[:2] - lo[:2]))
-d = float(os.environ.get("CAM_DIST", 0)) or max(2.0, 1.2 + 0.9 * extent)
-if view == "top":
-    d *= 1.3
-v = np.array([float(x) for x in dirs.get(view, dirs["overview"]).split()])
-pos = tgt + d * v / np.linalg.norm(v)
-f = lambda a: "[" + ",".join(f"{x:.3f}" for x in a) + "]"
-print(f"viewer.camera_position={f(pos)} viewer.camera_target={f(tgt)}")
+out = []
+for view in sys.argv[1:]:
+    d = float(os.environ.get("CAM_DIST", 0)) or max(2.0, 1.2 + 0.9 * extent)
+    if view == "top":
+        d *= 1.3
+    v = np.array([float(x) for x in dirs.get(view, dirs["overview"]).split()])
+    pos = tgt + d * v / np.linalg.norm(v)
+    out.append({"name": view, "position": [round(float(x), 3) for x in pos], "target": [round(float(x), 3) for x in tgt],
+                "path": f"{os.environ['PREFIX']}_{view}.mp4"})
+print(json.dumps(out))
 EOF
 }
 
 for ep in $EPS; do
   ck=$(python -c "import json; print(json.load(open('$SEL/checkpoints.json')).get('$ep', ''))")
   [ -n "$ck" ] && [ -f "$ck" ] || { echo "ep $ep: checkpoint not found ($ck)"; continue; }
-  pq=$(printf "%s/results/episode_%06d.parquet" "$SEL" "$ep")
+  pq=$(printf "%s/episode_%06d.parquet" "$RESULTS" "$ep")
+  if [ ! -f "$pq" ]; then echo "ep $ep: no evaluator trajectory $pq; skipped (set RESULTS=...)"; continue; fi
   # one video frame per 50 Hz control step; episode length = rows of the evaluated trajectory (stops at the reference end)
-  n=$(python -c "import pyarrow.parquet as pq; print(pq.ParquetFile('$pq').metadata.num_rows)" 2>/dev/null || echo 1500)
+  n=$(python -c "import pyarrow.parquet as pq; print(pq.ParquetFile('$pq').metadata.num_rows)")
+  [ -n "$n" ] || { echo "ep $ep: cannot read $pq; skipped"; continue; }
   mp4=$(printf "%s/ep_%02d.mp4" "$OUT" "$ep")          # all views + metric overlay
   if [ "$BACKEND" = mp4 ] && [ -f "$mp4" ]; then echo "skip ep $ep (exists)"; continue; fi
   echo "=== ep $ep  frames=$n  views: $VIEWS  $ck"
-  raws=()
-  for v in $VIEWS; do
-    raw=$(printf "%s/raw/ep_%02d_%s.mp4" "$OUT" "$ep" "$v")
-    old=$(printf "%s/raw/ep_%02d.mp4" "$OUT" "$ep")   # single-view render from an earlier version = overview
-    [ "$v" = overview ] && [ ! -f "$raw" ] && [ -f "$old" ] && mv "$old" "$raw"
-    if [ "$BACKEND" != mp4 ] || [ ! -f "$raw" ]; then
-      cam=$(cam_for "$pq" "$v")
-      echo "    $v camera: ${cam:-viewer default}"
-      (cd "$ROOT" && python "$VIEW" \
-          evaluation.checkpoint="$ck" \
-          evaluation.reset_mode=explicit evaluation.start_frame=0 evaluation.deterministic=true \
-          $EVAL_MATCH \
-          viewer.backend=$BACKEND viewer.output_path="$raw" viewer.num_frames=$n \
-          viewer.video_fps=50 viewer.realtime=false viewer.width=$W viewer.height=$H \
-          $cam $MARKERS $EXTRA \
-          hydra.run.dir="$OUT/hydra/ep_${ep}_$v" 2>&1 | grep -v "^Warp\|^Module" | tail -3)
-      [ "$BACKEND" = mp4 ] || break            # viser: interactive, first view only
-    fi
-    [ -f "$raw" ] && raws+=("$raw") || echo "    view $v FAILED"
-  done
+  prefix=$(printf "%s/raw/ep_%02d" "$OUT" "$ep")
+  traj="${prefix}_rollout.parquet"                    # object pose of THIS rollout (+ reference), for the overlay
+  raws=(); for v in $VIEWS; do raws+=("${prefix}_${v}.mp4"); done
+  have=1; for r in "${raws[@]}"; do [ -f "$r" ] || have=0; done; [ -f "$traj" ] || have=0
+  if [ "$BACKEND" != mp4 ]; then   # viser: interactive browser view of one run
+    cam=$(views_json "$pq" "$prefix" overview | python -c "import json,sys; v=json.load(sys.stdin)[0]; print('viewer.camera_position=[%s] viewer.camera_target=[%s]' % (','.join(map(str, v['position'])), ','.join(map(str, v['target']))))")
+    (cd "$ROOT" && python "$VIEW" evaluation.checkpoint="$ck" evaluation.reset_mode=explicit evaluation.start_frame=0 \
+        evaluation.deterministic=true $EVAL_MATCH viewer.backend=$BACKEND viewer.num_frames=$n viewer.realtime=true \
+        $cam $MARKERS $EXTRA hydra.run.dir="$OUT/hydra/ep_${ep}")
+    continue
+  fi
+  if [ "$have" = 0 ]; then
+    # one simulator run, every view drawn from it (separate runs drift apart: GPU contacts are not bitwise reproducible)
+    export MV_VIEWS=$(views_json "$pq" "$prefix" $VIEWS) MV_TRAJ="$traj" MV_REF="$pq"
+    echo "    cameras: $MV_VIEWS"
+    (cd "$ROOT" && python "$HERE/multiview_policy.py" \
+        evaluation.checkpoint="$ck" \
+        evaluation.reset_mode=explicit evaluation.start_frame=0 evaluation.deterministic=true \
+        $EVAL_MATCH \
+        viewer.backend=mp4 viewer.output_path="${prefix}_unused.mp4" viewer.num_frames=$n \
+        viewer.video_fps=$FPS viewer.realtime=false viewer.width=$W viewer.height=$H \
+        $MARKERS $EXTRA \
+        hydra.run.dir="$OUT/hydra/ep_${ep}" 2>&1 | grep -v "^Warp\|^Module" | tail -4)
+  fi
+  ok=(); for r in "${raws[@]}"; do [ -f "$r" ] && ok+=("$r"); done; raws=("${ok[@]}")
   [ "$BACKEND" = mp4 ] || continue
   [ ${#raws[@]} -gt 0 ] || { echo "FAILED ep $ep"; continue; }
   # label: object name and which run the checkpoint came from (selection.json from select_checkpoints.py)
@@ -111,8 +128,8 @@ s = json.load(open('$SEL/selection.json')).get('$ep', {}) if os.path.exists('$SE
 print(f\"ep $ep {s.get('object', '')} ({s.get('chosen', '?')})\")" 2>/dev/null || echo "ep $ep")
   names=()
   for r in "${raws[@]}"; do b=$(basename "$r" .mp4); names+=("${b#ep_*_}"); done
-  if [ -f "$pq" ] && [ "${OVERLAY:-1}" = 1 ]; then
-    python "$HERE/overlay_metrics.py" --video "${raws[@]}" --view-names "${names[@]}" --parquet "$pq" --out "$mp4" --label "$label" \
+  if [ -f "$traj" ] && [ "${OVERLAY:-1}" = 1 ]; then
+    python "$HERE/overlay_metrics.py" --video "${raws[@]}" --view-names "${names[@]}" --parquet "$traj" --out "$mp4" --label "$label" --step-hz "$FPS" \
       || python "$HERE/overlay_metrics.py" --video "${raws[@]}" --view-names "${names[@]}" --out "$mp4" --label "$label"
   else
     python "$HERE/overlay_metrics.py" --video "${raws[@]}" --view-names "${names[@]}" --out "$mp4" --label "$label"

@@ -110,6 +110,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--label", default="")
     ap.add_argument("--fps", type=float, default=None, help="output fps (default: input fps)")
+    ap.add_argument("--step-hz", type=float, default=50.0, help="control rate of the rollout, for the time label")
     args = ap.parse_args()
 
     import imageio_ffmpeg
@@ -187,7 +188,7 @@ def main() -> None:
         bad_frame = pos[i] > SP_POS_M or rot[i] > SP_ROT_RAD
 
         d.rectangle([px - 6, py - 6, px + int(430 * s), py + 8 * line + 6], fill=(0, 0, 0, 150))
-        d.text((px, py), f"{args.label}   step {i + 1}/{n}  t={i / 50:.2f}s", font=f_big, fill=WHITE)
+        d.text((px, py), f"{args.label}   step {i + 1}/{n}  t={i / args.step_hz:.2f}s", font=f_big, fill=WHITE)
         rows = [
             (f"pos err {100 * pos[i]:6.1f} cm   mean {100 * run_pos[i]:5.1f}", RED if pos[i] > SP_POS_M else WHITE),
             (f"rot err {np.degrees(rot[i]):6.1f} deg  mean {np.degrees(run_rot[i]):5.1f}",
