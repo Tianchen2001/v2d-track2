@@ -3,10 +3,10 @@
 Turn each palm of a retargeted G1 reference toward the object while the hand is near it.
 
 Per frame and hand (FK with pinocchio, main_with_hand.urdf):
-  gap, c   distance from <side>_hand_palm_link to the closest object surface point c
+  gap, c   distance from the palm centre (<side>_hand_palm_link + --pivot along x) to the closest object point c
   weight   1 at gap <= --touch, 0 at gap >= --near, linear in between, then a moving average over --blend frames
            so the turn fades in and out
-  target   palm position unchanged; palm rotation = the smallest rotation that takes the palm normal (palm-frame
+  target   palm centre (--pivot ahead of the palm link origin) unchanged; palm rotation = the smallest rotation that takes the palm normal (palm-frame
            axis --axis, default left -y / right +y = the side the fingers curl to) onto the direction to c, scaled
            by the weight, applied to the original palm rotation
   solve    damped least squares on the 7 arm joints of that side (shoulder pitch/roll/yaw, elbow, wrist
@@ -110,6 +110,8 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
     cols = {s: [jn.index(f"{s}_{a}_joint") for a in ARM] for s in SIDES}
     vidx = {s: [g1.jv(f"{s}_{a}_joint") for a in ARM] for s in SIDES}
     qcols = {s: [g1.jq(f"{s}_{a}_joint") for a in ARM] for s in SIDES}
+    c_loc = np.array([args.pivot, 0.0, 0.0])          # pivot point in the palm frame (palm centre, between the finger bases)
+    pt = lambda M: M.translation + M.rotation @ c_loc
 
     # pass 1: palm pose, closest object point, gap, angle on the original reference
     pal = {s: np.zeros((T, 3)) for s in SIDES}
@@ -124,8 +126,8 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
         tree = cKDTree(W)
         for s in SIDES:
             M = g1.d.oMf[fid[s]]
-            pal[s][t], Rpal[s][t] = M.translation, M.rotation
-            gap[s][t], k = tree.query(M.translation)
+            pal[s][t], Rpal[s][t] = pt(M), M.rotation
+            gap[s][t], k = tree.query(pal[s][t])
             cpt[s][t] = W[k]
             ang0[s][t] = facing(Rpal[s][t], n_loc[s], pal[s][t], cpt[s][t])
 
@@ -143,6 +145,8 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
         prev_delta = np.zeros(len(ARM))
         lo, hi = g1.lo[qcols[s]], g1.hi[qcols[s]]
         pos_res, rot_res = [], []
+        raw = np.zeros((T, len(ARM)))
+        bad = np.zeros(T, bool)
         for t in range(T):
             if wgt[s][t] < 1e-3:
                 prev_delta[:] = 0.0
@@ -164,11 +168,13 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
             for _ in range(args.iters):
                 pin.framesForwardKinematics(g1.m, g1.d, q)
                 M = g1.d.oMf[fid[s]]
-                e_p = p_tgt - M.translation
+                e_p = p_tgt - pt(M)
                 e_r = pin.log3(R_tgt @ M.rotation.T)
                 if np.linalg.norm(e_p) < 1e-4 and np.linalg.norm(e_r) < 1e-3:
                     break
                 J = pin.computeFrameJacobian(g1.m, g1.d, q, fid[s], pin.LOCAL_WORLD_ALIGNED)[:, vidx[s]]
+                r = M.rotation @ c_loc
+                J = np.vstack([J[:3] - pin.skew(r) @ J[3:], J[3:]])   # velocity of the pivot point
                 Jw = np.vstack([args.pos_weight * J[:3], J[3:]])
                 e = np.concatenate([args.pos_weight * e_p, e_r])
                 dq = Jw.T @ np.linalg.solve(Jw @ Jw.T + args.damping ** 2 * np.eye(6), e)
@@ -176,33 +182,53 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
                 q[qcols[s]] = np.clip(q[qcols[s]] + dq, lo, hi)
             pin.framesForwardKinematics(g1.m, g1.d, q)
             M = g1.d.oMf[fid[s]]
-            pr = np.linalg.norm(p_tgt - M.translation)
+            pr = np.linalg.norm(p_tgt - pt(M))
             rr = np.degrees(np.linalg.norm(pin.log3(R_tgt @ M.rotation.T)))
-            if pr > args.max_pos_res or rr > args.max_rot_res:   # IK did not get there: keep this frame as it was
+            if pr > args.max_pos_res or rr > args.max_rot_res:   # IK did not get there: filled in from the neighbours below
                 rejected[s] += 1
-                prev_delta[:] = 0.0
+                bad[t] = True
                 continue
             pos_res.append(pr)
             rot_res.append(rr)
-            qnew[t, cols[s]] = q[qcols[s]]
-            prev_delta = qnew[t, cols[s]] - qj[t, cols[s]]
-        delta = box(qnew[:, cols[s]] - qj[:, cols[s]], args.smooth)
-        # after smoothing: shrink the change on frames where the palm moved more than --max-drift
-        shrunk = 0
+            raw[t] = q[qcols[s]] - qj[t, cols[s]]
+            prev_delta = raw[t].copy()
+        # rejected frames inside a turned stretch: linear interpolation of the joint change between accepted frames
+        # (a hard drop to zero there was what made the arm stutter)
+        turned = wgt[s] >= 1e-3
+        good = turned & ~bad
+        if good.any():
+            idx_g = np.flatnonzero(good)
+            for j in range(len(ARM)):
+                raw[bad, j] = np.interp(np.flatnonzero(bad), idx_g, raw[idx_g, j])
+        raw[~turned] = 0.0
+        delta = box(raw, args.smooth)
+        # palm drift: per-frame scale (halving search), then the scale itself is smoothed (min filter + moving
+        # average), so a shrink on one frame fades in and out instead of jumping
+        scale = np.ones(T)
         for t in np.flatnonzero(np.abs(delta).max(axis=1) > 1e-6):
-            for _ in range(6):
+            sc = 1.0
+            for _ in range(7):
                 q = g1.q(rp[t], rq[t], qidx, qj[t])
-                q[qcols[s]] = np.clip(qj[t, cols[s]] + delta[t], lo, hi)
+                q[qcols[s]] = np.clip(qj[t, cols[s]] + sc * delta[t], lo, hi)
                 pin.framesForwardKinematics(g1.m, g1.d, q)
-                if np.linalg.norm(g1.d.oMf[fid[s]].translation - pal[s][t]) <= args.max_drift:
+                if np.linalg.norm(pt(g1.d.oMf[fid[s]]) - pal[s][t]) <= args.max_drift:
                     break
-                delta[t] *= 0.5
+                sc *= 0.5
             else:
-                delta[t] = 0.0
-            shrunk += 1 if _ > 0 else 0
-        qnew[:, cols[s]] = np.clip(qj[:, cols[s]] + delta, lo, hi)
+                sc = 0.0
+            scale[t] = sc
+        shrunk = int((scale < 1.0).sum())
+        k = max(1, args.smooth)
+        pad = np.pad(scale, (k // 2, k // 2), mode="edge")
+        scale = np.array([pad[i:i + k].min() for i in range(T)])
+        scale = np.clip(box(scale, k), 0.0, 1.0)
+        qnew[:, cols[s]] = np.clip(qj[:, cols[s]] + scale[:, None] * delta, lo, hi)
+        step0 = np.degrees(np.abs(np.diff(qj[:, cols[s]], axis=0)).max(axis=1))
+        step1 = np.degrees(np.abs(np.diff(qnew[:, cols[s]], axis=0)).max(axis=1))
+        jerk_stats = {"arm_step_max_deg": [round(float(step0.max()), 2), round(float(step1.max()), 2)],
+                      "arm_step_p99_deg": [round(float(np.percentile(step0, 99)), 2), round(float(np.percentile(step1, 99)), 2)]}
         stats[s] = {"frames_turned": int((wgt[s] > 1e-3).sum()) - rejected[s], "ik_rejected": rejected[s],
-                    "drift_shrunk": shrunk,
+                    "drift_shrunk": shrunk, **jerk_stats,
                     "ik_pos_res_max_cm": round(float(np.max(pos_res)) * 100, 2) if pos_res else 0.0,
                     "ik_rot_res_p90_deg": round(float(np.percentile(rot_res, 90)), 1) if rot_res else 0.0}
 
@@ -223,8 +249,8 @@ def process(args, g1: G1, p_in: Path, p_out: Path, tk: Path) -> dict:
         pin.framesForwardKinematics(g1.m, g1.d, q)
         for s in SIDES:
             M = g1.d.oMf[fid[s]]
-            ang1[s][t] = facing(M.rotation, n_loc[s], M.translation, cpt[s][t])
-            drift[s][t] = np.linalg.norm(M.translation - pal[s][t])
+            ang1[s][t] = facing(M.rotation, n_loc[s], pt(M), cpt[s][t])
+            drift[s][t] = np.linalg.norm(pt(M) - pal[s][t])
         if ee is not None:
             for e, name in enumerate(ee_names):
                 if g1.m.existFrame(name):
@@ -261,13 +287,14 @@ def main() -> None:
     ap.add_argument("--near", type=float, default=0.15, help="m: turn starts below this palm-object gap")
     ap.add_argument("--touch", type=float, default=0.05, help="m: full turn below this gap")
     ap.add_argument("--blend", type=int, default=15, help="frames: moving average of the turn weight")
-    ap.add_argument("--smooth", type=int, default=9, help="frames: moving average of the joint change")
+    ap.add_argument("--smooth", type=int, default=9, help="frames: moving average of the joint change (and of the drift scale)")
     ap.add_argument("--iters", type=int, default=40)
     ap.add_argument("--damping", type=float, default=0.05)
     ap.add_argument("--pos-weight", type=float, default=5.0, help="palm position vs orientation weight in the IK")
     ap.add_argument("--max-turn", type=float, default=75.0, help="deg: at most this much turn away from the original palm rotation (partial facing beyond it)")
     ap.add_argument("--max-pos-res", type=float, default=0.02, help="m: IK palm position residual above which a frame is left as is")
     ap.add_argument("--max-rot-res", type=float, default=30.0, help="deg: IK rotation residual above which a frame is left as is")
+    ap.add_argument("--pivot", type=float, default=0.0, help="m along the palm-frame x (toward the fingers): the point kept fixed and measured from; 0 = palm link origin at the wrist")
     ap.add_argument("--max-drift", type=float, default=0.02, help="m: after smoothing, shrink the change where the palm moved more")
     args = ap.parse_args()
 
@@ -295,7 +322,8 @@ def main() -> None:
             x = st[s]
             print(f"   {s:5s} turned {x['frames_turned']:4d} frames (IK rejected {x['ik_rejected']}, drift-shrunk {x['drift_shrunk']}) | angle near {x['angle_near_median_deg'][0]} -> "
                   f"{x['angle_near_median_deg'][1]} deg, touch {x['angle_touch_median_deg'][0]} -> {x['angle_touch_median_deg'][1]} deg"
-                  f" | palm drift max {x['palm_drift_max_cm']} cm, IK rot res p90 {x['ik_rot_res_p90_deg']} deg")
+                  f" | palm drift max {x['palm_drift_max_cm']} cm, IK rot res p90 {x['ik_rot_res_p90_deg']} deg"
+                  f" | arm step max {x['arm_step_max_deg'][0]} -> {x['arm_step_max_deg'][1]} deg/frame, p99 {x['arm_step_p99_deg'][0]} -> {x['arm_step_p99_deg'][1]}")
         stage_src, stage_dst = src / "whole_body/reconstructed_stage", dst / "whole_body/reconstructed_stage"
         stage_dst.mkdir(parents=True, exist_ok=True)
         for f in stage_src.glob(f"{sid}*_support.usda"):
